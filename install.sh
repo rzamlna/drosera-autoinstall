@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "hella one click"
+echo "CREATED JANETF.ETH"
 echo "Drosera auto install"
 
 # 1. User inputs
