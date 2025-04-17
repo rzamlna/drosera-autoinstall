@@ -1,73 +1,148 @@
 #!/bin/bash
 
-set -e
+echo "hella one click"
+echo "Drosera auto install"
 
-echo ">>> [1/9] Update & install dependencies"
-sudo apt update && sudo apt upgrade -y
-sudo apt install curl git jq lz4 build-essential -y
+# 1. User inputs
+read -p "Enter your GitHub email: " GHEMAIL
+read -p "Enter your GitHub username: " GHUSER
+read -p "Enter your Drosera private key (starts with 0x): " PK
+read -p "Enter your VPS public IP: " VPSIP
 
-echo ">>> [2/9] Install Go"
-cd $HOME
-GO_VERSION="1.21.1"
-wget https://golang.org/dl/go$GO_VERSION.linux-amd64.tar.gz
-sudo rm -rf /usr/local/go
-sudo tar -C /usr/local -xzf go$GO_VERSION.linux-amd64.tar.gz
-rm go$GO_VERSION.linux-amd64.tar.gz
-echo "export PATH=\$PATH:/usr/local/go/bin:\$HOME/go/bin" >> ~/.bash_profile
-source ~/.bash_profile
+if [[ -z "$PK" || -z "$VPSIP" || -z "$GHEMAIL" || -z "$GHUSER" ]]; then
+  echo "❌ Missing info. All fields are required."
+  exit 1
+fi
 
-echo ">>> [3/9] Clone Drosera repo & build"
-cd $HOME
-git clone https://github.com/0xmoei/Drosera-Network
-cd Drosera-Network
-make install
+# 2. Install dependencies
+echo "📦 Installing dependencies..."
+sudo apt-get update && sudo apt-get upgrade -y
+sudo apt install curl ufw iptables build-essential git wget lz4 jq make gcc nano automake autoconf tmux htop nvme-cli libgbm1 pkg-config libssl-dev libleveldb-dev tar clang bsdmainutils ncdu unzip libleveldb-dev -y
 
-echo ">>> [4/9] Setup chain config"
-CHAIN_ID="drosera_11983-1"
-NODE_MONIKER="drosera-node"
-droserad config chain-id $CHAIN_ID
-droserad config keyring-backend test
-droserad config node tcp://localhost:26657
+# 3. Install Drosera CLI
+curl -L https://app.drosera.io/install | bash
+source ~/.bashrc
+droseraup
 
-echo ">>> [5/9] Initialize node"
-droserad init "$NODE_MONIKER" --chain-id $CHAIN_ID
+# 4. Install Foundry CLI
+curl -L https://foundry.paradigm.xyz | bash
+source ~/.bashrc
+foundryup
 
-echo ">>> [6/9] Download genesis and addrbook"
-curl -Ls https://raw.githubusercontent.com/0xmoei/Drosera-Network/main/genesis.json > ~/.drosera/config/genesis.json
-curl -Ls https://snapshots-testnet.nodejumper.io/drosera-testnet/addrbook.json > ~/.drosera/config/addrbook.json
+# 5. Install Bun
+curl -fsSL https://bun.sh/install | bash
+source ~/.bashrc
 
-echo ">>> [7/9] Setup Cosmovisor"
-go install cosmossdk.io/tools/cosmovisor/cmd/cosmovisor@latest
-mkdir -p ~/.drosera/cosmovisor/genesis/bin
-cp $(which droserad) ~/.drosera/cosmovisor/genesis/bin/
-ln -s ~/.drosera/cosmovisor/genesis ~/.drosera/cosmovisor/current
-sudo ln -s ~/.drosera/cosmovisor/current/bin/droserad /usr/local/bin/droserad
+# 6. Set up drosera trap project
+mkdir -p ~/my-drosera-trap && cd ~/my-drosera-trap
+git config --global user.email "$GHEMAIL"
+git config --global user.name "$GHUSER"
+forge init -t drosera-network/trap-foundry-template
 
-echo ">>> [8/9] Create systemd service"
-sudo tee /etc/systemd/system/droserad.service > /dev/null <<EOF
+# 7. Build trap
+bun install
+forge build
+
+# 8. Deploy Trap (1st apply)
+echo "Deploying trap to Holesky, your wallet need balance of holesky eth buddy"
+DROSERA_PRIVATE_KEY=$PK drosera apply <<< "ofc"
+
+# 9. Edit drosera.toml to whitelist operator
+echo "Whitelisting operator..."
+cd ~/my-drosera-trap
+read -p "📬 Enter the PUBLIC address linked to your used private key (starts with 0x): " OP_ADDR
+
+if [[ -z "$OP_ADDR" ]]; then
+  echo "❌ Public address is required to whitelist operator."
+  exit 1
+fi
+echo -e '\nprivate_trap = true\nwhitelist = ["'"$OP_ADDR"'"]' >> drosera.toml
+
+# 10. Deploy Trap again (2nd apply)
+echo "Re-applying trap config with whitelist..."
+DROSERA_PRIVATE_KEY=$PK drosera apply <<< "ofc"
+
+# 11. Download operator binary
+cd ~
+curl -LO https://github.com/drosera-network/releases/releases/download/v1.16.2/drosera-operator-v1.16.2-x86_64-unknown-linux-gnu.tar.gz
+tar -xvf drosera-operator-v1.16.2-x86_64-unknown-linux-gnu.tar.gz
+sudo cp drosera-operator /usr/bin
+chmod +x /usr/bin/drosera-operator
+
+# 12. Register operator
+echo "Registering operator..."
+drosera-operator register --eth-rpc-url https://ethereum-holesky-rpc.publicnode.com --eth-private-key $PK
+
+# 13. Open ports
+sudo ufw disable
+
+# 14. Create systemd service
+echo "Setting up systemd service..."
+
+# Check if the user is root or not
+CURRENT_USER=$(whoami)
+if [ "$CURRENT_USER" != "root" ]; then
+  USER=$CURRENT_USER
+else
+  USER="root"
+fi
+
+# Use the username dynamically instead of hardcoding root
+sudo tee /etc/systemd/system/drosera.service > /dev/null <<EOF
 [Unit]
-Description=Drosera Node
+Description=drosera node service
 After=network-online.target
 
 [Service]
 User=$USER
-ExecStart=$(which cosmovisor) start
-Restart=on-failure
-RestartSec=3
+Restart=always
+RestartSec=15
 LimitNOFILE=65535
-Environment="DAEMON_HOME=$HOME/.drosera"
-Environment="DAEMON_NAME=droserad"
-Environment="UNSAFE_SKIP_BACKUP=true"
-Environment="PATH=$PATH:/usr/local/go/bin:$HOME/go/bin"
+ExecStart=/usr/bin/drosera-operator node --db-file-path /home/$USER/.drosera.db --network-p2p-port 31313 --server-port 31314 \\
+    --eth-rpc-url https://ethereum-holesky-rpc.publicnode.com \\
+    --eth-backup-rpc-url https://1rpc.io/holesky \\
+    --drosera-address 0xea08f7d533C2b9A62F40D5326214f39a8E3A32F8 \\
+    --eth-private-key $PK \\
+    --listen-address 0.0.0.0 \\
+    --network-external-p2p-address $VPSIP \\
+    --disable-dnr-confirmation true
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-echo ">>> [9/9] Start node"
-sudo systemctl daemon-reexec
+# 15. Start systemd service
 sudo systemctl daemon-reload
-sudo systemctl enable droserad
-sudo systemctl start droserad
+sudo systemctl enable drosera
+sudo systemctl start drosera
 
-echo ">>> DONE! You can check logs with: journalctl -fu droserad -o cat"
+# ⚠️ Trap must be deployed at this point!
+
+# Parse deployed trap address from drosera apply log
+TRAP_ADDR=$(cat ~/.drosera/deployments.json | jq -r '.[0].trapAddress')
+
+if [[ -z "$TRAP_ADDR" || "$TRAP_ADDR" == "null" ]]; then
+  echo "❌ Could not auto-detect trap address. Please check manually in the Drosera dashboard."
+  exit 1
+fi
+
+BLOOM_URL="https://app.drosera.io/trap?trapId=$TRAP_ADDR"
+
+echo ""
+echo "🌱 Your trap has been deployed at: $TRAP_ADDR"
+echo "💸 You MUST send Bloom Boost to it before continuing."
+echo "🧭 Go to this link in your browser and click 'Send Bloom Boost':"
+echo ""
+echo "👉 $BLOOM_URL"
+echo ""
+read -p "⏳ Press Enter once you've sent the Bloom Boost..."
+
+# 16. Run dryrun
+echo "📡 Running drosera dryrun..."
+drosera dryrun
+
+# 17. Done
+echo ""
+echo "✅ All done. Node running via systemd."
+echo "💻 Logs: journalctl -u drosera -f"
+echo "🌐 Dashboard: https://app.drosera.io"
